@@ -1,53 +1,52 @@
 package com.maveric.gatewayservice.filter;
 
-import com.maveric.gatewayservice.dto.GateWayRequestDto;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.maveric.gatewayservice.dto.ErrorDto;
 import com.maveric.gatewayservice.dto.GateWayResponseDto;
-import com.maveric.gatewayservice.feignconsumer.JwtUtil;
 import com.maveric.gatewayservice.util.JwtAuthUtil;
 import io.jsonwebtoken.Claims;
+import org.slf4j.Logger;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cloud.context.config.annotation.RefreshScope;
 import org.springframework.cloud.gateway.filter.GatewayFilter;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
+import org.springframework.core.io.buffer.DataBufferFactory;
 import org.springframework.http.*;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.server.reactive.ServerHttpResponse;
 import org.springframework.stereotype.Component;
-import org.springframework.web.client.RestTemplate;
 import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 
-import java.util.Arrays;
 
 @RefreshScope
 @Component
 public class JwtAuthFilter implements GatewayFilter {
 
+    private static final Logger log = org.slf4j.LoggerFactory.getLogger(JwtAuthFilter.class);
     @Autowired
     private RouterValidator routerValidator;
-    @Autowired
-    private JwtUtil jwtUtil;
+
 
     @Autowired
     private JwtAuthUtil jwtAuthUtil;
 
+    @Autowired
+    ObjectMapper objectMapper;
+
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
         ServerHttpRequest request = exchange.getRequest();
-
+        log.info("API gateway passing through filter");
         if (routerValidator.isSecured.test(request)) {
             if (this.isAuthMissing(request))
                 return this.onError(exchange, "Authorization header is missing in request", HttpStatus.UNAUTHORIZED);
 
-            final String token = this.getAuthHeader(request);
-            System.out.println("Token->"+token);
-            String tokenn = token.substring(7);
-            System.out.println("Token->"+tokenn);
-            GateWayRequestDto gateWayRequestDto = new GateWayRequestDto(token);
+            final String raw_token = this.getAuthHeader(request);
+            String token = raw_token.substring(7);
 
             try {
-                GateWayResponseDto gateWayResponseDto = validateToken(tokenn);
-                System.out.println("gateWayResponseDto->"+gateWayResponseDto.isResponse()+"--"+gateWayResponseDto.getClaims());
+                GateWayResponseDto gateWayResponseDto = validateToken(token);
                 if (!gateWayResponseDto.isResponse())
                     return this.onError(exchange, "Authorization header is invalid", HttpStatus.UNAUTHORIZED);
 
@@ -55,7 +54,8 @@ public class JwtAuthFilter implements GatewayFilter {
             }
             catch(Exception e)
             {
-                System.out.println("Exception during validation of token-"+e);
+                log.error("Exception in validating the token");
+                return this.onError(exchange, "Exception in validating the token", HttpStatus.INTERNAL_SERVER_ERROR);
             }
         }
         return chain.filter(exchange);
@@ -65,8 +65,20 @@ public class JwtAuthFilter implements GatewayFilter {
     /*PRIVATE*/
 
     private Mono<Void> onError(ServerWebExchange exchange, String err, HttpStatus httpStatus) {
+        DataBufferFactory dataBufferFactory = exchange.getResponse().bufferFactory();
         ServerHttpResponse response = exchange.getResponse();
         response.setStatusCode(httpStatus);
+        try {
+            response.getHeaders().add("Content-Type", "application/json");
+            ErrorDto errorDto = new ErrorDto(String.valueOf(httpStatus.value()), err);
+            byte[] byteData = objectMapper.writeValueAsBytes(errorDto);
+            log.error("Filter blockage ->{}",errorDto.getMessage());
+            return response.writeWith(Mono.just(byteData).map(dataBufferFactory::wrap));
+
+        } catch (Exception e) {
+            log.error("Unexpected error-{}",e.getMessage());
+
+        }
         return response.setComplete();
     }
 
@@ -80,24 +92,17 @@ public class JwtAuthFilter implements GatewayFilter {
 
     private void populateRequestWithHeaders(ServerWebExchange exchange, Claims claims) {
         exchange.getRequest().mutate()
-                .header("id", String.valueOf(claims.get("sub")))
+                .header("userEmail", String.valueOf(claims.get("sub")))
+                .header("userId", String.valueOf(claims.get("jti")))
                 .build();
     }
 
     private GateWayResponseDto validateToken(String token) {
         try {
-            //ResponseEntity<GateWayResponseDto> responseEntity = jwtUtil.validateToken(gateWayRequestDto);
-            GateWayResponseDto responseEntity = jwtAuthUtil.validateToken(token);
-            /*HttpHeaders headers = new HttpHeaders();
-            headers.setAccept(Arrays.asList(MediaType.APPLICATION_JSON));
-            HttpEntity<GateWayRequestDto> entity = new HttpEntity<GateWayRequestDto>(gateWayRequestDto,headers);
-            GateWayResponseDto responseEntity = restTemplate.exchange("http://localhost:3000/api/v1/auth/validate", HttpMethod.POST, entity, GateWayResponseDto.class).getBody(); */
-            System.out.println("Success Validation of token->"+responseEntity.isResponse());
-            return responseEntity;
+            return jwtAuthUtil.validateToken(token);
         }
         catch (Exception e)
         {
-            System.out.println("Exception with feign !! -> "+e);
             return new GateWayResponseDto();
         }
 
